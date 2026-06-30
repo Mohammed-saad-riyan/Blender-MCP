@@ -1,0 +1,16 @@
+# Blender MCP Server Requirements
+# These packages are automatically installed by the addon on first run
+# You can also manually install them using Blender's Python
+
+# Core MCP Server Dependencies
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+docstring-parser>=0.15
+
+# Numerical Computing
+numpy>=1.24.0
+
+# PolyMCP - Required for agent orchestration
+# Install from GitHub:
+# pip install git+https://github.com/llm-use/Polymcp.git
