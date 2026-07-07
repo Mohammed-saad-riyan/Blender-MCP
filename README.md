@@ -1,157 +1,340 @@
-# Blender MCP Server
+# Blender MCP
 
-**Model Context Protocol (MCP) server for complete Blender control via API**
+> Turn natural-language intent into verifiable Blender operations through an MCP-compatible tool server.
 
-This addon transforms Blender into an MCP server, exposing 50+ powerful tools that can be orchestrated by AI agents through HTTP endpoints. Perfect for AI-driven 3D workflows, automation, and creative experimentation.
+Blender MCP is a Blender add-on that exposes Blender capabilities as agent-callable tools. It is built around a constraint that matters in real 3D automation: Blender data must be mutated safely on Blender's main thread even when requests arrive through an HTTP server.
 
-## ✨ Features
+The server therefore separates **request handling** from **scene execution**. FastAPI/PolyMCP receives tool calls, a bounded queue hands Blender work to a timer-driven main-thread executor, and structured results are returned to the agent. The repository also includes viewport capture, spatial analysis, and operation verification primitives for visual feedback loops.
 
-- **🚀 50+ Tools** - Complete control over Blender's features:
-  - Object creation, manipulation, and transformation
-  - Material and shader system management
-  - Animation and keyframe control
-  - Camera and lighting setup
-  - Modifiers and constraints
-  - Physics simulations (rigid body, cloth, fluid)
-  - Geometry nodes and procedural generation
-  - File import/export operations
-  - Scene optimization and batch operations
+## Why this project exists
 
-- **🔒 Thread-Safe Execution** - Enterprise-grade queue system for safe concurrent operations
-- **📦 Auto-Install Dependencies** - Automatically installs required packages on first run
-- **🎮 Simple UI Panel** - Start/stop server with one click from Blender's N-panel
-- **📊 Real-time Monitoring** - Track operations, statistics, and server status
-- **🔧 Production-Ready** - Comprehensive error handling, logging, and caching
+LLMs can plan 3D work, but reliable execution requires more than giving a model arbitrary Python access. A useful agent interface needs:
 
-## 🚀 Quick Start
+- discoverable, typed tools instead of unrestricted code execution;
+- main-thread-safe access to Blender's `bpy` API;
+- structured success and failure responses;
+- bounded queues and operation timeouts;
+- visual/spatial feedback for checking what actually changed;
+- a protocol that can be used by an agent orchestrator rather than a one-off script.
 
-### Installation
+Blender MCP implements that layer.
 
-1. Download `blender_mcp.py`
-2. Open Blender
-3. Go to **Edit → Preferences → Add-ons**
-4. Click the **dropdown arrow** (⌄) next to the search bar
-5. Select **Install from Disk...**
-6. Choose the downloaded `blender_mcp.py` file
-7. Enable the addon by checking the box next to "MCP Complete Server for Blender"
+## Architecture
 
-### Starting the Server
+```mermaid
+flowchart LR
+    U[User intent] --> A[LLM / Agent]
+    A -->|discover tools| M[MCP interface]
+    A -->|invoke typed tool| M
+    M --> H[FastAPI / PolyMCP adapter]
+    H --> Q[Bounded execution queue]
+    Q --> T[Blender main-thread timer]
+    T --> B[bpy / bmesh / mathutils]
+    B --> R[Structured result store]
+    R --> H
+    H --> A
+    B --> V[Viewport + spatial verification]
+    V --> A
+```
 
-1. Press **N** in the 3D Viewport to open the sidebar
-2. Navigate to the **MCP Server** tab
-3. Click **Start Server**
-4. Server will start on `http://localhost:8000`
+### Execution model
 
-The addon will automatically install required dependencies on first run (FastAPI, Uvicorn, Pydantic, etc.).
+```mermaid
+sequenceDiagram
+    participant Agent
+    participant API as MCP/API layer
+    participant Queue as ThreadSafeExecutor
+    participant Blender as Blender main thread
 
-## 🤖 Using with PolyMCP
+    Agent->>API: invoke(tool, arguments)
+    API->>Queue: enqueue UUID + callable + args
+    Queue-->>API: wait for result
+    Blender->>Queue: timer drains pending work
+    Queue->>Blender: execute bpy operation
+    alt success
+        Blender-->>Queue: structured result
+        Queue-->>API: success
+        API-->>Agent: tool result
+    else exception
+        Blender-->>Queue: exception
+        Queue-->>API: structured error
+        API-->>Agent: failure context
+    else timeout
+        Queue-->>API: timeout after configured limit
+        API-->>Agent: timeout error
+    end
+```
 
-This MCP server is designed to work seamlessly with **[PolyMCP](https://github.com/llm-use/Polymcp)** - a powerful framework for orchestrating MCP servers with AI agents.
+## Core engineering decisions
 
-### Example: AI-Controlled Blender
+### Main-thread-safe Blender execution
+
+`bpy` operations are not treated as arbitrary web-server work. `ThreadSafeExecutor` places operations into a bounded queue and uses `bpy.app.timers` to execute them on Blender's main thread. Each request receives a UUID, result state, timestamp, timeout, and cleanup lifecycle.
+
+### Tool surface, not arbitrary code execution
+
+The add-on exposes purpose-built operations for scene construction and manipulation. The tool surface covers object transforms, materials, animation, cameras, lighting, modifiers, constraints, physics, geometry workflows, import/export, scene utilities, and visual verification.
+
+### Visual feedback loop
+
+The server contains primitives for:
+
+- viewport capture for VLM inspection;
+- spatial layout summaries;
+- post-operation verification against expected object state;
+- camera framing and automatic object arrangement.
+
+This allows an agent workflow to move from **act** to **observe** to **verify**, rather than assuming a successful function return means the scene is correct.
+
+## Protocol
+
+The repository supports an MCP-oriented agent flow and also exposes HTTP endpoints for direct inspection.
+
+### Tool discovery
+
+```text
+GET /mcp/list_tools
+```
+
+The client receives the available tool definitions and their argument schemas.
+
+### Tool invocation
+
+```text
+POST /mcp/invoke/{tool_name}
+Content-Type: application/json
+
+{
+  "arguments": {
+    "...": "tool-specific arguments"
+  }
+}
+```
+
+Conceptually, every invocation follows this lifecycle:
+
+```text
+request -> validate arguments -> enqueue -> execute on Blender main thread
+        -> serialize result/error -> return to agent
+```
+
+The HTTP adapter is intentionally separated from Blender execution semantics. Agents can reason concurrently; Blender scene mutation remains serialized and safe.
+
+## Representative capabilities
+
+| Area | Examples |
+|---|---|
+| Scene construction | create and transform objects, collections, text and curves |
+| Materials | create materials, configure shaders and assign slots |
+| Animation | keyframes, timelines and object animation |
+| Camera & lighting | create cameras/lights, frame scenes and configure views |
+| Physics | particles and simulation-oriented operations |
+| Geometry | modifiers, constraints and procedural workflows |
+| Files | import/export and scene operations |
+| Agent feedback | viewport capture, spatial analysis and result verification |
+
+## Agent example
 
 ```python
-#!/usr/bin/env python3
 import asyncio
 from polymcp.polyagent import UnifiedPolyAgent, OllamaProvider
 
 async def main():
-    # Initialize your LLM provider
-    llm = OllamaProvider(model="gpt-oss:120b-cloud", temperature=0.1)
-    
-    # Connect to Blender MCP server
     agent = UnifiedPolyAgent(
-        llm_provider=llm, 
-        mcp_servers=["http://localhost:8000/mcp"],  
-        verbose=True
+        llm_provider=OllamaProvider(
+            model="gpt-oss:120b-cloud",
+            temperature=0.1,
+        ),
+        mcp_servers=["http://localhost:8000/mcp"],
+        verbose=True,
     )
-    
-    async with agent:
-        print("✅ Blender MCP Server connected!\n")
-        
-        # Chat with your AI to control Blender
-        while True:
-            user_input = input("\n🎨 You: ")
-            
-            if user_input.lower() in ['exit', 'quit']:
-                break
-            
-            result = await agent.run_async(user_input, max_steps=5)
-            print(f"\n🤖 Blender: {result}")
 
-if __name__ == "__main__":
-    asyncio.run(main())
+    async with agent:
+        result = await agent.run_async(
+            "Create a metallic cube, light it with a three-point setup, "
+            "frame it with a camera, then verify the final scene.",
+            max_steps=8,
+        )
+        print(result)
+
+asyncio.run(main())
 ```
 
-### Example Commands
+## Example agent trace
 
-Once connected, you can ask the AI agent to:
+The exact tool names depend on the exposed registry, but a successful run should look structurally like this:
 
-- *"Create a cube at position (0, 0, 0) with size 2"*
-- *"Add a red metallic material to the selected object"*
-- *"Create a camera looking at the origin"*
-- *"Set up a simple lighting scene with 3 lights"*
-- *"Add a fluid simulation to the cube"*
-- *"Export the scene as an FBX file"*
-- *"Create an animation rotating the object 360 degrees over 100 frames"*
+```text
+USER
+Create a metallic cube, add a camera and three-point lighting, then verify it.
 
-**That's it!** PolyMCP handles all the complexity of:
-- Tool discovery and selection
-- Multi-step task planning
-- Error handling and retries
-- State management across operations
+AGENT
+1. Inspect available scene and creation tools.
+2. Create the mesh.
+3. Create and assign a metallic material.
+4. Add key, fill and rim lights.
+5. Position a camera to frame the scene.
+6. Capture/inspect the viewport.
+7. Verify expected object state.
 
-This makes it incredibly simple to build AI-powered Blender automation tools!
+TOOL RESULT
+{ "status": "success", "object": "Cube", ... }
 
-## 📡 API Endpoints
+TOOL RESULT
+{ "status": "success", "material": "Metal", ... }
 
-Once the server is running, you can access:
+VERIFICATION
+{
+  "success": true,
+  "issues": [],
+  "spatial_context": { ... },
+  "viewport": { ... }
+}
+```
 
-- **API Documentation**: `http://localhost:8000/docs`
-- **List All Tools**: `http://localhost:8000/mcp/list_tools`
-- **Invoke Tool**: `POST http://localhost:8000/mcp/invoke/{tool_name}`
+See [`docs/AGENT_TRACE.md`](docs/AGENT_TRACE.md) for a trace template that can be replaced with a captured real run.
 
+## Failure and retry behavior
 
-## 🔧 Configuration
+Failures are first-class outputs. The execution layer records the function, bounded argument context, traceback, timestamp, and error state. A higher-level agent can use that information to repair arguments or choose a different tool.
 
-You can customize the server by editing the `Config` class in `blender_mcp.py`:
+Example:
+
+```text
+Attempt 1: assign material to "ProductCube"
+Result: object not found
+
+Agent recovery:
+- inspect scene objects
+- identify actual object name "Cube"
+- retry material assignment with corrected target
+
+Attempt 2: success
+```
+
+The server itself does not hide failures behind infinite retries. Retry policy belongs to the orchestrating agent, where step limits and recovery strategies can be controlled explicitly.
+
+## Installation
+
+### Requirements
+
+- Blender 3.0+
+- Python packages used by the add-on: FastAPI, Uvicorn, Pydantic, docstring-parser and NumPy
+- PolyMCP when using the MCP agent integration
+
+### Install the add-on
+
+1. Download `blender_mcp.py`.
+2. Open Blender.
+3. Go to **Edit -> Preferences -> Add-ons**.
+4. Choose **Install from Disk...**.
+5. Select `blender_mcp.py` and enable the add-on.
+6. Press **N** in the 3D Viewport and open the **MCP Server** panel.
+7. Start the server.
+
+By default the service runs on `http://localhost:8000`.
+
+> The current implementation can install missing Python dependencies from Blender's Python environment. For controlled environments, pre-install and pin dependencies instead of relying on runtime installation.
+
+## Configuration
 
 ```python
 class Config:
-    HOST = "0.0.0.0"           # Server host
-    PORT = 8000                # Server port
-    AUTO_INSTALL_PACKAGES = True  # Auto-install dependencies
-    THREAD_SAFE_OPERATIONS = True  # Enable thread-safe execution
-    ENABLE_CACHING = True      # Enable result caching
+    HOST = "0.0.0.0"
+    PORT = 8000
+    QUEUE_TIMEOUT = 30.0
+    QUEUE_CHECK_INTERVAL = 0.01
+    MAX_QUEUE_SIZE = 1000
+    THREAD_SAFE_OPERATIONS = True
+    AUTO_INSTALL_PACKAGES = True
+    ENABLE_CACHING = True
+    CACHE_SIZE = 256
 ```
 
-## 📋 Requirements
+## Validation and benchmarks
 
-The addon automatically installs these dependencies:
+This repository includes evidence-oriented tooling rather than hard-coded performance claims.
 
-- FastAPI
-- Uvicorn
-- Pydantic
-- docstring-parser
-- NumPy
-- PolyMCP
+### Static tests
 
-**Blender Version**: 3.0.0 or higher
+```bash
+python -m unittest discover -s tests -v
+```
 
-## 🐛 Troubleshooting
+The initial suite verifies important source-level invariants without requiring Blender in CI: bounded queue configuration, UUID request IDs, timeout handling, timer-based main-thread processing, error capture, and result cleanup.
 
-**Server won't start?**
-- Check Blender's System Console for error messages (Window → Toggle System Console)
-- Ensure port 8000 is not already in use
-- Try restarting Blender after installation
+### Concurrent request benchmark
 
-**Dependencies not installing?**
-- Manually install packages using Blender's Python:
-  ```bash
-  /path/to/blender/python -m pip install fastapi uvicorn pydantic docstring-parser numpy
-  ```
+Run Blender with the server enabled, then execute:
 
-**Can't find MCP Server panel?**
-- Press **N** in the 3D Viewport
-- Look for "MCP Server" tab in the sidebar
-- Make sure the addon is enabled in Preferences
+```bash
+python benchmarks/concurrent_requests.py \
+  --url http://localhost:8000 \
+  --endpoint /mcp/list_tools \
+  --requests 100 \
+  --concurrency 10
+```
+
+The benchmark reports success/failure counts, throughput, and p50/p95/p99 latency. Commit measured results only after running them on a named machine and Blender version; the repository intentionally does not invent benchmark numbers.
+
+See [`benchmarks/README.md`](benchmarks/README.md).
+
+## Demo evidence
+
+The strongest demo for this project is a single uninterrupted recording showing:
+
+```text
+natural-language request
+    -> agent tool discovery
+    -> visible tool calls
+    -> Blender scene changing
+    -> verification result
+    -> final viewport
+```
+
+Place the recording at `docs/assets/blender-mcp-demo.gif` and the README will become a direct proof artifact rather than only a technical description.
+
+## CI
+
+GitHub Actions runs source-level tests and Python syntax checks on every push and pull request. Blender-dependent integration tests remain a separate local validation stage because standard hosted runners do not provide the interactive Blender runtime used by the add-on.
+
+## Current limitations
+
+- Blender operations are serialized by design; concurrency improves request handling, not simultaneous scene mutation.
+- Some Blender APIs differ across major versions and require compatibility testing.
+- Runtime dependency installation is convenient for demos but should be replaced by pinned environment provisioning for controlled deployments.
+- Visual verification primitives exist, but end-to-end VLM judging depends on the chosen agent/orchestrator.
+- Authentication is not the focus of the current local server and should be added before exposing the service outside a trusted network.
+
+## Roadmap
+
+- [ ] Record and embed the end-to-end demo GIF/video
+- [ ] Capture a real agent trace from a multi-step scene task
+- [ ] Add Blender-runtime integration tests for representative tools
+- [ ] Publish benchmark results with hardware and Blender version metadata
+- [ ] Add authentication for non-local deployments
+- [ ] Add versioned tool schemas and compatibility matrix
+- [ ] Add structured tracing/OpenTelemetry integration
+
+## Repository structure
+
+```text
+.
+├── blender_mcp.py
+├── tests/
+│   └── test_source_invariants.py
+├── benchmarks/
+│   ├── README.md
+│   └── concurrent_requests.py
+├── docs/
+│   └── AGENT_TRACE.md
+└── .github/workflows/ci.yml
+```
+
+## Engineering summary
+
+Blender MCP is not a chat wrapper around Blender. It is an agent execution boundary: typed tools on one side, Blender's stateful main-thread runtime on the other, with queueing, timeouts, structured failures, and visual verification connecting them.
+
+## License
+
+Add a license before external distribution or reuse.
